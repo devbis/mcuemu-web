@@ -51,6 +51,7 @@ const openYamlBlocks = new Set<string>();
 const controlLevels = new Map<string, boolean>();
 const softUartDecoders = new Map<string, { component: Extract<BenchComponent, { kind: 'soft-uart' }>; decoder: SoftUartDecoder }>();
 const softUartNetDecoders = new Map<string, Array<{ endpoint: string; decoder: SoftUartDecoder }>>();
+const softUartPinNets = new Set<string>();
 let activeCapturePaths: string[] = [];
 const LOG_FEEDS = ['event-feed', 'uart-feed', 'radio-feed', 'net-feed'] as const;
 const MIN_LOG_HEIGHT = 80;
@@ -147,6 +148,10 @@ function netCount(count: number): string {
   const last = count % 10;
   const word = last === 1 && lastTwo !== 11 ? 'сеть' : last >= 2 && last <= 4 && (lastTwo < 12 || lastTwo > 14) ? 'сети' : 'сетей';
   return `${value} ${word}`;
+}
+
+function visiblePinEndpoints(): EndpointInfo[] {
+  return activeEndpoints.filter((endpoint) => endpoint.kind === 'net' && !softUartPinNets.has(endpoint.name));
 }
 
 function watchControls(watch: WatchOptions, prefix: 'preset' | 'yaml', radioAvailable = true): string {
@@ -303,7 +308,7 @@ function renderSimulation(): string {
   if (!activeWorld) return '';
   const kinds = ['uart', 'radio', 'net'] as const;
   const labels: Record<(typeof kinds)[number], string> = { uart: 'UART', radio: 'Radio', net: 'Pins' };
-  const watchedNets = activeEndpoints.filter((endpoint) => endpoint.kind === 'net');
+  const watchedNets = visiblePinEndpoints();
   const drives = watchedNets.map((endpoint) => {
     const label = activeWorld!.netLabels[endpoint.name] ?? endpoint.name;
     const current = pinLevels.has(endpoint.name) ? (pinLevels.get(endpoint.name) ? 'HIGH' : 'LOW') : translate('floating');
@@ -1064,6 +1069,7 @@ async function launchWorld(world: StoredWorld): Promise<void> {
   controlLevels.clear();
   softUartDecoders.clear();
   softUartNetDecoders.clear();
+  softUartPinNets.clear();
   activeWorld = world;
   activeCapturePaths = world.captures ?? [];
   for (const component of world.bench?.components ?? []) {
@@ -1072,6 +1078,8 @@ async function launchWorld(world: StoredWorld): Promise<void> {
       const decoder = new SoftUartDecoder(component.baud);
       softUartDecoders.set(component.id, { component, decoder });
       const net = netId(component.cpuId, component.txPin);
+      softUartPinNets.add(net);
+      softUartPinNets.add(netId(component.cpuId, component.rxPin));
       const list = softUartNetDecoders.get(net) ?? [];
       list.push({ endpoint: `${component.cpuId}.${component.id}`, decoder });
       softUartNetDecoders.set(net, list);
@@ -1455,7 +1463,7 @@ function renderEventLists(): void {
   }
   const total = document.querySelector<HTMLElement>('#event-total');
   if (total) total.textContent = eventCount(eventBuffer.size);
-  for (const endpoint of activeEndpoints.filter((item) => item.kind === 'net')) {
+  for (const endpoint of visiblePinEndpoints()) {
     const latest = [...events].reverse().find((event) => event.kind === 'net' && event.endpoint === endpoint.name);
     if (latest) pinLevels.set(endpoint.name, latest.value);
   }
@@ -1463,7 +1471,7 @@ function renderEventLists(): void {
 }
 
 function updateDriveStates(): void {
-  for (const endpoint of activeEndpoints.filter((item) => item.kind === 'net')) {
+  for (const endpoint of visiblePinEndpoints()) {
     const label = activeWorld?.netLabels[endpoint.name] ?? endpoint.name;
     const rows = document.querySelectorAll<HTMLElement>('.drive-row');
     rows.forEach((row) => {
@@ -1515,14 +1523,18 @@ function storageErrorText(error: unknown): string {
 }
 
 client.setEventListener((event) => {
-  recordEvent(event);
+  const showInEventFeed = event.kind !== 'net' || !softUartPinNets.has(event.endpoint);
+  if (showInEventFeed) recordEvent(event);
   if (event.kind === 'net' && typeof event.value === 'boolean') {
     for (const watcher of softUartNetDecoders.get(event.endpoint) ?? []) {
       const bytes = watcher.decoder.feed(event.timeNs, event.value);
-      if (bytes.length) pushSoftUartBytes(watcher.endpoint, bytes, event.timeNs);
+      if (bytes.length) {
+        pushSoftUartBytes(watcher.endpoint, bytes, event.timeNs);
+        scheduleEventRender();
+      }
     }
   }
-  scheduleEventRender();
+  if (showInEventFeed) scheduleEventRender();
 });
 client.setStatusListener((status) => {
   activeStatus = status;
