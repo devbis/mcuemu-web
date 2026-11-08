@@ -9,6 +9,8 @@ interface BlobRow {
 }
 
 interface SaveWorldInput {
+  id?: string;
+  run?: boolean;
   title: string;
   yaml: string;
   staged: Record<string, StagedFirmware>;
@@ -35,11 +37,6 @@ function requestValue<T>(request: IDBRequest<T>): Promise<T> {
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error ?? new Error('Could not read from IndexedDB.'));
   });
-}
-
-async function sha256(data: string): Promise<string> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
-  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export async function hashFile(file: File): Promise<StagedFirmware> {
@@ -69,22 +66,12 @@ export class WorldStore {
 
   async save(input: SaveWorldInput): Promise<StoredWorld> {
     const firmwares: Record<string, FirmwareRef> = {};
-    const sortedRefs: Record<string, string> = {};
     for (const [key, item] of Object.entries(input.staged).sort(([a], [b]) => a.localeCompare(b))) {
       firmwares[key] = { hash: item.hash, name: item.name, size: item.size };
-      sortedRefs[key] = item.hash;
     }
-    const signature = JSON.stringify({
-      yaml: input.yaml.replace(/\r\n/g, '\n'),
-      firmwares: sortedRefs,
-      watch: input.watch,
-      preset: input.preset,
-      bench: input.bench ?? null,
-      captures: input.captures ?? [],
-    });
-    const id = (await sha256(signature)).slice(0, 24);
-    const worldsStore = this.db.transaction('worlds', 'readonly').objectStore('worlds');
-    const existing = await requestValue(worldsStore.get(id)) as StoredWorld | undefined;
+    const id = input.id ?? crypto.randomUUID();
+    const currentWorlds = await this.list();
+    const existing = currentWorlds.find((world) => world.id === id);
     const now = Date.now();
     const world: StoredWorld = {
       id,
@@ -96,13 +83,22 @@ export class WorldStore {
       ...(input.bench ? { bench: structuredClone(input.bench) } : {}),
       ...(input.captures ? { captures: [...input.captures] } : {}),
       createdAt: existing?.createdAt ?? now,
-      lastRunAt: now,
+      lastRunAt: input.run ? now : existing?.lastRunAt ?? 0,
       preset: input.preset,
     };
     const transaction = this.db.transaction(['worlds', 'blobs'], 'readwrite');
     const blobStore = transaction.objectStore('blobs');
     for (const item of Object.values(input.staged)) {
       blobStore.put({ hash: item.hash, bytes: item.bytes, size: item.size, name: item.name } satisfies BlobRow);
+    }
+    const referenced = new Set(Object.values(firmwares).map((firmware) => firmware.hash));
+    for (const world of currentWorlds) {
+      if (world.id !== id) Object.values(world.firmwares).forEach((firmware) => referenced.add(firmware.hash));
+    }
+    if (existing) {
+      for (const firmware of Object.values(existing.firmwares)) {
+        if (!referenced.has(firmware.hash)) blobStore.delete(firmware.hash);
+      }
     }
     transaction.objectStore('worlds').put(world);
     await transactionDone(transaction);
@@ -127,7 +123,7 @@ export class WorldStore {
     const transaction = this.db.transaction('worlds', 'readonly');
     const rows = await requestValue(transaction.objectStore('worlds').getAll()) as StoredWorld[];
     await transactionDone(transaction);
-    return rows.sort((a, b) => b.lastRunAt - a.lastRunAt);
+    return rows.sort((a, b) => (b.lastRunAt || b.createdAt) - (a.lastRunAt || a.createdAt));
   }
 
   async blob(hash: string): Promise<BlobRow> {

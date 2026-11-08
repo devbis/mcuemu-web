@@ -37,7 +37,9 @@ Scenario blocks specify the delay after the previous step and an action: send HE
 
 The generator automatically creates nets for selected GPIO pins. Supported 802.15.4 radios can share `air0`; when capture is enabled, a PCAP with virtual timestamps is available after pausing. Wi-Fi, Bluetooth, and Ethernet capture are not connected in this version. Custom systems can be imported from one self-contained YAML file without `include` or Lua scripts. ROM/eFuse/RF calibration dumps and `flash.persist` are not loaded by the browser yet.
 
-Worlds and firmware images are stored in IndexedDB. Running the same configuration updates its history entry; logs from a simulation run remain in memory only.
+Saved emulator configurations appear on the first tab. Open one with **Edit** to change it in the Editor, or use **Run** to start it immediately. **Save** stores changes without starting the simulation; **Run** stores and opens the separate **Simulation** tab. Use **Back to editor** there to return to settings. Each saved emulator keeps its own ID, so editing and saving or running it updates that same list entry. Firmware images are deduplicated in IndexedDB by content; logs remain in memory only.
+
+The Editor switches between functional bench blocks and the complete YAML document. Imported YAML can be edited as a whole or through the structural block editor when valid.
 
 ## Interface languages
 

@@ -20,8 +20,12 @@ const commonFilter: Record<SimEvent['kind'], boolean> = { uart: true, radio: tru
 
 let store: WorldStore | undefined;
 let worlds: StoredWorld[] = [];
-let storageEstimate: { usage?: number; quota?: number } = {};
-let tab: 'preset' | 'yaml' | 'saved' = 'preset';
+let tab: 'worlds' | 'editor' | 'run' = 'worlds';
+let editorKind: 'bench' | 'yaml' = 'bench';
+let editorMode: 'visual' | 'blocks' | 'yaml' = 'visual';
+let editingWorldId: string | undefined;
+let editingTitle = 'New emulation';
+let yamlBenchSource: { draft: BenchDraft; text: string } | undefined;
 let yamlWatch: WatchOptions = { uart: true, radio: true };
 let presetFiles: Record<string, StagedFirmware> = {};
 let yamlFiles: Record<string, StagedFirmware> = {};
@@ -48,6 +52,38 @@ const controlLevels = new Map<string, boolean>();
 const softUartDecoders = new Map<string, { component: Extract<BenchComponent, { kind: 'soft-uart' }>; decoder: SoftUartDecoder }>();
 const softUartNetDecoders = new Map<string, Array<{ endpoint: string; decoder: SoftUartDecoder }>>();
 let activeCapturePaths: string[] = [];
+const LOG_FEEDS = ['event-feed', 'uart-feed', 'radio-feed', 'net-feed'] as const;
+const MIN_LOG_HEIGHT = 80;
+const MAX_LOG_HEIGHT = 900;
+const MIN_PANEL_RATIO = 0.25;
+const MAX_PANEL_RATIO = 0.75;
+
+function storedLogHeights(): Record<string, number> {
+  const heights: Record<string, number> = {};
+  try {
+    const stored = JSON.parse(localStorage.getItem('mcuemu-web.log-heights') ?? '{}') as Record<string, unknown>;
+    for (const id of LOG_FEEDS) {
+      const value = Number(stored[id]);
+      if (Number.isFinite(value) && value >= MIN_LOG_HEIGHT && value <= MAX_LOG_HEIGHT) heights[id] = value;
+    }
+  } catch {
+    // Use the default sizes when browser storage is unavailable.
+  }
+  return heights;
+}
+
+function storedPanelRatio(): number {
+  try {
+    const value = Number(localStorage.getItem('mcuemu-web.uart-radio-ratio'));
+    if (Number.isFinite(value) && value >= MIN_PANEL_RATIO && value <= MAX_PANEL_RATIO) return value;
+  } catch {
+    // Use equal columns when browser storage is unavailable.
+  }
+  return 0.5;
+}
+
+const logHeights = storedLogHeights();
+let uartPanelRatio = storedPanelRatio();
 
 const escapeHtml = (value: unknown): string => String(value)
   .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -140,7 +176,7 @@ function renderPreset(): string {
       <div class="scenario-add">${bench.components.filter((item) => item.kind === 'hardware-uart').map((item) => `<button class="button button--quiet button--small" data-add-step="hardware-uart-send" data-component-id="${escapeHtml(item.id)}">＋ Send to ${escapeHtml(item.port)}</button>`).join('')}${bench.components.filter((item) => item.kind === 'soft-uart').map((item) => `<button class="button button--quiet button--small" data-add-step="soft-uart-send" data-component-id="${escapeHtml(item.id)}">＋ Send over soft UART</button>`).join('')}${bench.components.filter((item) => item.kind === 'gpio-control').map((item) => `<button class="button button--quiet button--small" data-add-step="gpio-set" data-component-id="${escapeHtml(item.id)}">＋ Press ${escapeHtml(item.label)}</button>`).join('')}</div>
       ${openYamlBlocks.has('scenario') ? `<textarea class="bench-yaml" id="scenario-yaml" spellcheck="false">${escapeHtml(stringify({ steps: bench.steps }, { lineWidth: 0 }))}</textarea><button type="button" class="button button--quiet button--small" id="apply-scenario-yaml">Apply YAML</button>` : ''}
     </section>
-    <div class="form-footer"><p>${firmwareCount(needs.length)} · ${translate('saved locally')}</p><button type="button" class="button button--primary" id="launch-preset" ${busy || !needs.every((need) => presetFiles[need.key]) ? 'disabled' : ''}>${busy ? 'Preparing…' : 'Run test bench'} <span>↗</span></button></div>
+    <div class="form-footer"><p>${firmwareCount(needs.length)} · ${translate('saved locally')}</p><button type="button" class="button button--quiet" id="save-editor" ${busy || !needs.every((need) => presetFiles[need.key]) ? 'disabled' : ''}>Save</button><button type="button" class="button button--primary" id="run-editor" ${busy || !needs.every((need) => presetFiles[need.key]) ? 'disabled' : ''}>${busy ? 'Preparing…' : 'Run'} <span>↗</span></button></div>
   </section>`;
 }
 
@@ -211,14 +247,12 @@ function renderYamlImport(): string {
     firmwareSection = `<div class="field file-field"><div class="field-title"><label>Firmware images</label><span class="hint">${firmwareCount(parsedYaml.needs.length, 'file')}</span></div>${selectedFirmwareRows(parsedYaml.needs, yamlFiles)}</div>`;
   }
   return `<section class="card setup-card">
-    <div class="card-heading"><div><span class="eyebrow">Custom system</span><h2>Load YAML</h2><p class="card-lead">Use a single self-contained file. Select firmware for each MCU.</p></div><span class="step-mark">02</span></div>
+    <div class="card-heading"><div><span class="eyebrow">Custom system</span><h2>${escapeHtml(editingTitle)}</h2><p class="card-lead">Use a single self-contained file. Select firmware for each MCU.</p></div></div>
     <div class="yaml-file-row"><label class="button button--quiet" for="yaml-file">Choose YAML file</label><input id="yaml-file" type="file" accept=".yaml,.yml,text/yaml,text/plain" /><span class="muted">${escapeHtml(yamlName === 'My configuration' ? translate(yamlName) : yamlName)}</span></div>
-    <div class="field"><label for="yaml-text">Configuration</label><textarea id="yaml-text" spellcheck="false" placeholder="version: 1&#10;devices:&#10;  - id: board&#10;    mcus:&#10;      - id: main&#10;        model: tlsr8258&#10;        firmware: firmware.bin">${escapeHtml(yamlText)}</textarea><p class="hint">No includes or Lua scripts. ROM, eFuse, RF calibration, and flash.persist are not supported yet.</p></div>
-    <div class="button-row"><button type="button" class="button button--quiet" id="validate-yaml">Validate configuration</button>${parsedYaml ? `<span class="validation-ok">${escapeHtml(translate(`✓ MCUs found: ${parsedYaml.needs.length}`))}</span>` : ''}</div>
-    ${parsedYaml ? `<div class="field"><div class="field-title"><label>Configuration blocks</label><span class="hint">Each block has a visual editor and a YAML editor</span></div>${renderBlockEditor(parsedYaml.value, blockModes)}</div>` : ''}
+    ${editorMode === 'yaml' ? `<div class="field"><label for="yaml-text">Configuration</label><textarea id="yaml-text" spellcheck="false" placeholder="version: 1&#10;devices:&#10;  - id: board&#10;    mcus:&#10;      - id: main&#10;        model: tlsr8258&#10;        firmware: firmware.bin">${escapeHtml(yamlText)}</textarea><p class="hint">No includes or Lua scripts. ROM, eFuse, RF calibration, and flash.persist are not supported yet.</p></div><div class="button-row"><button type="button" class="button button--quiet" id="validate-yaml">Validate configuration</button>${parsedYaml ? `<span class="validation-ok">${escapeHtml(translate(`✓ MCUs found: ${parsedYaml.needs.length}`))}</span>` : ''}</div>` : parsedYaml ? `<div class="field"><div class="field-title"><label>Configuration blocks</label><span class="hint">Edit each part visually or open its YAML.</span></div>${renderBlockEditor(parsedYaml.value, blockModes)}</div>` : '<p class="empty-inline">Load or validate a YAML configuration to edit its blocks.</p>'}
     ${firmwareSection}
     <div class="field"><div class="field-title"><label>Monitoring</label><span class="hint">Nets from the YAML will appear in the pins panel</span></div>${watchControls(yamlWatch, 'yaml', true)}</div>
-    <div class="form-footer"><p>The YAML and selected firmware images will be saved to history.</p><button type="button" class="button button--primary" id="launch-yaml" ${busy || !parsedYaml ? 'disabled' : ''}>${busy ? 'Preparing…' : 'Run YAML'} <span>↗</span></button></div>
+    <div class="form-footer"><p>The YAML and selected firmware images will be saved to history.</p><button type="button" class="button button--quiet" id="save-editor" ${busy || !parsedYaml ? 'disabled' : ''}>Save</button><button type="button" class="button button--primary" id="run-editor" ${busy || !parsedYaml ? 'disabled' : ''}>${busy ? 'Preparing…' : 'Run'} <span>↗</span></button></div>
   </section>`;
 }
 
@@ -234,17 +268,35 @@ function renderSaved(): string {
     const uniqueHashes = new Set(Object.values(world.firmwares).map((item) => item.hash));
     const bytes = Object.values(world.firmwares).filter((item, index, all) => all.findIndex((candidate) => candidate.hash === item.hash) === index).reduce((sum, item) => sum + item.size, 0);
     const kind = world.preset === 'yaml' ? 'YAML' : world.bench?.cpus.length ? `${world.bench.cpus.length} CPU` : world.preset === 'pair' ? 'Coordinator + router' : 'Single MCU';
+    const title = world.bench ? displayWorldTitle(world) : world.title;
     return `<article class="world-row">
-      <div class="world-row__info"><span class="world-type">${escapeHtml(translate(kind))}</span><h3>${escapeHtml(displayWorldTitle(world))}</h3><p>${escapeHtml(`${translate('Last run')} ${new Date(world.lastRunAt).toLocaleString(activeLocale())} · ${formatBytes(bytes)} · ${firmwareCount(uniqueHashes.size, 'file')}`)}</p></div>
-      <div class="world-row__actions"><button type="button" class="button button--small button--primary" data-run-world="${escapeHtml(world.id)}" ${busy ? 'disabled' : ''}>Run</button><button type="button" class="icon-button" data-delete-world="${escapeHtml(world.id)}" aria-label="Remove world">Remove</button></div>
+      <div class="world-row__info"><span class="world-type">${escapeHtml(translate(kind))}</span><h3>${escapeHtml(title)}</h3><p>${escapeHtml(world.lastRunAt ? `${translate('Last run')} ${new Date(world.lastRunAt).toLocaleString(activeLocale())}` : translate('Not run yet'))} · ${formatBytes(bytes)} · ${firmwareCount(uniqueHashes.size, 'file')}</p></div>
+      <div class="world-row__actions"><button type="button" class="button button--small button--quiet" data-edit-world="${escapeHtml(world.id)}" ${busy ? 'disabled' : ''}>Edit</button><button type="button" class="button button--small button--primary" data-run-world="${escapeHtml(world.id)}" ${busy ? 'disabled' : ''}>Run</button><button type="button" class="icon-button" data-delete-world="${escapeHtml(world.id)}" aria-label="Remove world">Remove</button></div>
     </article>`;
   }).join('');
-  const quota = storageEstimate.quota ? ` ${translate('of')} ${formatBytes(storageEstimate.quota)}` : '';
   return `<section class="card history-card">
-    <div class="card-heading"><div><span class="eyebrow">On this device</span><h2>Saved worlds</h2><p class="card-lead">Configuration history is stored in IndexedDB. Simulation logs are not saved.</p></div><span class="step-mark">03</span></div>
-    <div class="storage-meter"><span class="storage-icon">▤</span><span>Used <strong>${formatBytes(storageEstimate.usage)}${quota}</strong></span><button type="button" class="text-button" id="refresh-worlds">Refresh</button></div>
-    <div class="world-list">${rows || '<div class="empty-state"><span>◇</span><strong>No history yet</strong><p>Configurations you run will appear here.</p></div>'}</div>
+    <div class="card-heading"><div><span class="eyebrow">On this device</span><h2>Worlds</h2><p class="card-lead">Your saved emulator configurations. Logs are not saved.</p></div><button type="button" class="button button--primary" id="new-world">＋ New emulation</button></div>
+    <div class="world-list">${rows || `<div class="empty-state"><span>◇</span><strong>${escapeHtml(translate('No saved emulations yet'))}</strong><p>${escapeHtml(translate('Create an emulation to get started.'))}</p></div>`}</div>
   </section>`;
+}
+
+function renderEditor(): string {
+  const content = editorKind === 'bench' && editorMode === 'visual' ? renderPreset() : renderYamlImport();
+  const blockAvailable = editorKind === 'yaml' && Boolean(parsedYaml);
+  return `<section class="editor-page">
+    <div class="editor-toolbar"><div><span class="eyebrow">${editingWorldId ? 'Saved world' : 'New configuration'}</span><h2>${escapeHtml(editingTitle)}</h2></div><div class="editor-toolbar__actions">
+      ${editorKind === 'bench' && editorMode === 'visual' ? '<button type="button" class="button button--quiet" id="editor-full-yaml">Edit full YAML</button>' : ''}
+      ${editorKind === 'yaml' && editorMode === 'yaml' ? `<button type="button" class="button button--quiet" id="editor-blocks" ${blockAvailable ? '' : 'disabled'}>Blocks</button>` : ''}
+      ${editorKind === 'yaml' && editorMode === 'blocks' ? '<button type="button" class="button button--quiet" id="editor-full-yaml">Edit full YAML</button>' : ''}
+      ${editorKind === 'yaml' ? '<button type="button" class="button button--quiet" id="editor-bench">New bench</button>' : '<button type="button" class="button button--quiet" id="editor-import-yaml">Import YAML</button>'}
+    </div></div>
+    ${content}
+  </section>`;
+}
+
+function renderRun(): string {
+  if (!activeWorld) return `<section class="card empty-state"><strong>${escapeHtml(translate('No active run'))}</strong><button type="button" class="button button--quiet" data-tab="editor">${escapeHtml(translate('Back to editor'))}</button></section>`;
+  return `<section class="run-page"><div class="run-toolbar"><div><span class="eyebrow">${escapeHtml(translate('Running configuration'))}</span><h2>${escapeHtml(displayWorldTitle(activeWorld))}</h2></div><button type="button" class="button button--quiet" data-tab="editor">← ${escapeHtml(translate('Back to editor'))}</button></div>${renderSimulation()}</section>`;
 }
 
 function renderSimulation(): string {
@@ -266,17 +318,27 @@ function renderSimulation(): string {
   }).join('');
   const captures = activeCapturePaths.length ? `<div class="capture-actions">${activeCapturePaths.map((path, index) => `<button type="button" class="button button--quiet button--small" data-download-capture="${index}" ${activeStatus.running ? 'disabled' : ''}>Download PCAP · ${escapeHtml(path.split('/').pop())}</button>`).join('')}<span>${activeStatus.running ? 'Pause the simulation to download the capture.' : 'The capture is updated as frames arrive.'}</span></div>` : '';
   return `<section class="simulation card" id="simulation">
-    <div class="simulation-head"><div><span class="eyebrow">Current run</span><h2>${escapeHtml(displayWorldTitle(activeWorld))}</h2><p id="sim-status" class="sim-status">Preparing…</p></div><div class="simulation-controls"><button type="button" class="button button--quiet" id="pause-sim" ${activeStatus.running ? '' : 'disabled'}>Pause</button><button type="button" class="button button--primary" id="run-sim" ${activeStatus.running ? 'disabled' : ''}>Resume <span>↗</span></button></div></div>
+    <div class="simulation-head"><div><span class="eyebrow">Current run</span><h2>${escapeHtml(displayWorldTitle(activeWorld))}</h2><p id="sim-status" class="sim-status">Preparing…</p></div><div class="simulation-controls"><button type="button" class="button button--quiet" id="pause-sim" ${activeStatus.running && !busy ? '' : 'disabled'}>Pause</button><button type="button" class="button button--primary" id="run-sim" ${activeStatus.running || busy ? 'disabled' : ''}>Resume <span>↗</span></button><button type="button" class="button button--quiet" id="restart-sim" ${activeStatus.loaded && !busy ? '' : 'disabled'}>Restart</button></div></div>
     <div class="sim-summary"><span>${activeEndpoints.filter((item) => item.kind === 'uart' || item.kind === 'uart-frames').length} UART</span><span>${activeEndpoints.filter((item) => item.kind === 'radio').length} ${translate('radio')}</span><span>${netCount(watchedNets.length)}</span><span id="event-total">${escapeHtml(eventCount(0))}</span></div>
     ${liveControls ? `<section class="live-controls"><strong>Buttons and switches</strong><div>${liveControls}</div></section>` : ''}${captures}
     <div class="event-grid">
-      <section class="event-panel event-panel--wide"><div class="panel-heading"><div><span class="panel-index">A</span><h3>All events</h3></div><div class="feed-filters">${kinds.map((kind) => `<label><input type="checkbox" data-feed-filter="${kind}" ${commonFilter[kind] ? 'checked' : ''} /><span class="dot dot--${kind}"></span>${labels[kind]}</label>`).join('')}</div></div><div class="event-list" id="event-feed"></div></section>
-      <section class="event-panel"><div class="panel-heading"><div><span class="panel-index">B</span><h3>UART</h3></div><span class="panel-count" id="count-uart">0</span></div><div class="event-list" id="uart-feed"></div></section>
-      <section class="event-panel"><div class="panel-heading"><div><span class="panel-index">C</span><h3>Radio traffic</h3></div><span class="panel-count" id="count-radio">0</span></div><div class="event-list" id="radio-feed"></div></section>
-      <section class="event-panel event-panel--wide"><div class="panel-heading"><div><span class="panel-index">D</span><h3>Pins and nets</h3></div><span class="panel-count" id="count-net">${watchedNets.length}</span></div>${drives ? `<div class="drive-list">${drives}</div>` : '<p class="empty-inline">This YAML defines no nets. The built-in generator adds them automatically.</p>'}<div class="event-list event-list--compact" id="net-feed"></div></section>
+      <section class="event-panel event-panel--wide"><div class="panel-heading"><div><span class="panel-index">A</span><h3>All events</h3></div><div class="feed-filters">${kinds.map((kind) => `<label><input type="checkbox" data-feed-filter="${kind}" ${commonFilter[kind] ? 'checked' : ''} /><span class="dot dot--${kind}"></span>${labels[kind]}</label>`).join('')}</div></div><div class="event-list" id="event-feed"></div>${heightResizer('event-feed')}</section>
+      <section class="event-panel"><div class="panel-heading"><div><span class="panel-index">B</span><h3>UART</h3></div><span class="panel-count" id="count-uart">0</span></div><div class="event-list" id="uart-feed"></div>${heightResizer('uart-feed')}</section>
+      ${widthResizer()}
+      <section class="event-panel"><div class="panel-heading"><div><span class="panel-index">C</span><h3>Radio traffic</h3></div><span class="panel-count" id="count-radio">0</span></div><div class="event-list" id="radio-feed"></div>${heightResizer('radio-feed')}</section>
+      <section class="event-panel event-panel--wide"><div class="panel-heading"><div><span class="panel-index">D</span><h3>Pins and nets</h3></div><span class="panel-count" id="count-net">${watchedNets.length}</span></div>${drives ? `<div class="drive-list">${drives}</div>` : '<p class="empty-inline">This YAML defines no nets. The built-in generator adds them automatically.</p>'}<div class="event-list event-list--compact" id="net-feed"></div>${heightResizer('net-feed')}</section>
     </div>
     <p class="buffer-note">The current simulation keeps up to 10,000 events. The feed is cleared when you start a new run.</p>
   </section>`;
+}
+
+function heightResizer(feedId: typeof LOG_FEEDS[number]): string {
+  const height = logHeights[feedId] ?? (feedId === 'net-feed' ? 155 : 214);
+  return `<div class="event-height-resizer" data-resize-height="${feedId}" role="separator" aria-orientation="horizontal" aria-valuemin="${MIN_LOG_HEIGHT}" aria-valuemax="${MAX_LOG_HEIGHT}" aria-valuenow="${height}" aria-label="Resize log panel" title="Drag to resize" tabindex="0"><span></span></div>`;
+}
+
+function widthResizer(): string {
+  return `<div class="event-width-resizer" id="event-width-resizer" role="separator" aria-orientation="vertical" aria-valuemin="${MIN_PANEL_RATIO * 100}" aria-valuemax="${MAX_PANEL_RATIO * 100}" aria-valuenow="${Math.round(uartPanelRatio * 100)}" aria-label="Resize UART and radio panel widths" title="Drag to resize" tabindex="0"><span></span></div>`;
 }
 
 function render(): void {
@@ -284,19 +346,19 @@ function render(): void {
   document.title = translate('mcuemu — microcontroller lab in your browser');
   document.querySelector<HTMLMetaElement>('meta[name="description"]')?.setAttribute('content', translate('Run mcuemu microcontroller emulation locally in your browser.'));
   const activeClass = (name: string) => tab === name ? 'tab is-active' : 'tab';
-  const currentContent = tab === 'preset' ? renderPreset() : tab === 'yaml' ? renderYamlImport() : renderSaved();
+  const currentContent = tab === 'editor' ? renderEditor() : tab === 'run' ? renderRun() : renderSaved();
   const locales = availableLocales();
   root.innerHTML = `<div class="page-shell">
     <header class="topbar"><a class="brand" href="#" aria-label="mcuemu"><span class="brand-mark">μ</span><span>mcuemu<span class="brand-light">/web</span></span></a><span class="local-badge"><span></span> Runs entirely in your browser</span>${locales.length > 1 ? `<label class="language-picker"><span>Language</span><select id="language-select" aria-label="Language">${locales.map((locale) => `<option value="${escapeHtml(locale.code)}" ${locale.code === activeLocale() ? 'selected' : ''}>${escapeHtml(locale.name)}</option>`).join('')}</select></label>` : ''}<a class="source-link" href="https://github.com/devbis/mcuemu" target="_blank" rel="noreferrer">Source project ↗</a></header>
     <main>
-      <section class="hero"><div class="hero-copy"><span class="eyebrow">WEBASSEMBLY · BROWSER SANDBOX</span><h1>Microcontrollers.<br /><em>In motion.</em></h1><p>Run firmware and monitor UART, radio traffic, and pins. YAML and firmware files stay on your device.</p></div><div class="hero-visual" aria-hidden="true"><div class="orbit orbit--outer"></div><div class="orbit orbit--inner"></div><div class="chip-core"><span>MCU</span><b>↗</b></div><i class="signal signal--one"></i><i class="signal signal--two"></i><i class="signal signal--three"></i><span class="visual-label visual-label--top">LOCAL SIM</span><span class="visual-label visual-label--bottom">32–160 MHz</span></div></section>
-      <nav class="tabs" aria-label="Workspace"><button class="${activeClass('preset')}" data-tab="preset"><span class="tab-number">01</span>Bench</button><button class="${activeClass('yaml')}" data-tab="yaml"><span class="tab-number">02</span>Custom YAML</button><button class="${activeClass('saved')}" data-tab="saved"><span class="tab-number">03</span>History <span class="history-count">${worlds.length}</span></button></nav>
+      <nav class="tabs" aria-label="Workspace"><button class="${activeClass('worlds')}" data-tab="worlds">Worlds <span class="history-count">${worlds.length}</span></button><button class="${activeClass('editor')}" data-tab="editor">Editor</button><button class="${activeClass('run')}" data-tab="run" ${activeWorld ? '' : 'disabled'}>Simulation</button></nav>
       <div id="notice" class="notice ${noticeError ? 'is-error' : 'is-success'}" ${notice ? '' : 'hidden'}>${escapeHtml(translate(notice))}</div>
-      <div class="content-grid"><div class="main-column">${currentContent}${renderSimulation()}</div><aside class="side-column"><section class="side-card"><div class="side-icon">⌘</div><h3>Emulation without a server</h3><p>The WASM module runs the chip model in this tab. Firmware files never leave your device.</p><div class="side-divider"></div><div class="side-stat"><span>Storage</span><strong>IndexedDB</strong></div><div class="side-stat"><span>Event limit</span><strong>10 000</strong></div></section><section class="side-card side-card--accent"><span class="eyebrow">First time here?</span><h3>Start with TLSR8258</h3><p>Choose a firmware image and UART monitor. Add a second CPU if needed.</p><button type="button" class="text-button" data-tab="preset">Open bench <span>↗</span></button></section><div class="privacy-note"><span>▣</span><p>Storage belongs to this browser. Clearing site data will delete saved worlds.</p></div></aside></div>
+      <div class="workspace">${currentContent}</div>
       <footer class="footer"><span>mcuemu-web · Local lab</span><span>YAML and logs are never sent to a server</span></footer>
     </main>
   </div>`;
   localizeUi(root);
+  applyResizerSettings();
   bindUi();
   renderEventLists();
   updateStatusDom();
@@ -309,7 +371,7 @@ function bindUi(): void {
   });
   root.querySelectorAll<HTMLElement>('[data-tab]').forEach((button) => button.addEventListener('click', () => {
     const nextTab = button.dataset.tab;
-    if (nextTab === 'preset' || nextTab === 'yaml' || nextTab === 'saved') {
+    if (nextTab === 'worlds' || nextTab === 'editor' || nextTab === 'run' && activeWorld) {
       tab = nextTab;
       render();
     }
@@ -323,7 +385,7 @@ function bindUi(): void {
   root.querySelectorAll<HTMLInputElement>('[data-fw-key]').forEach((input) => input.addEventListener('change', () => {
     const file = input.files?.[0];
     const key = String(input.dataset.fwKey);
-    const isYaml = tab === 'yaml';
+    const isYaml = editorKind === 'yaml';
     if (!file) return;
     void hashFile(file).then((staged) => {
       (isYaml ? yamlFiles : presetFiles)[key] = staged;
@@ -536,18 +598,70 @@ function bindUi(): void {
   root.querySelector<HTMLInputElement>('#bench-pcap')?.addEventListener('change', (event) => {
     bench.capturePcap = (event.currentTarget as HTMLInputElement).checked;
   });
-  root.querySelector<HTMLButtonElement>('#launch-preset')?.addEventListener('click', () => void launchPreset());
+  root.querySelector<HTMLButtonElement>('#new-world')?.addEventListener('click', () => void newEditor());
+  root.querySelector<HTMLButtonElement>('#editor-import-yaml')?.addEventListener('click', () => {
+    editorKind = 'yaml';
+    editorMode = 'yaml';
+    yamlBenchSource = undefined;
+    yamlText = '';
+    yamlName = 'My configuration';
+    parsedYaml = undefined;
+    yamlFiles = {};
+    blockModes = {};
+    render();
+  });
+  root.querySelector<HTMLButtonElement>('#editor-bench')?.addEventListener('click', () => void newEditor());
+  root.querySelector<HTMLButtonElement>('#editor-full-yaml')?.addEventListener('click', () => {
+    if (editorKind === 'bench') {
+      try {
+        const result = benchYaml(bench);
+        yamlBenchSource = { draft: structuredClone(bench), text: result.yaml };
+        yamlText = result.yaml;
+        parsedYaml = parseWorldYaml(yamlText);
+        yamlFiles = { ...presetFiles };
+        yamlWatch = {
+          uart: bench.components.some((component) => component.kind === 'hardware-uart' || component.kind === 'soft-uart'),
+          radio: bench.radioEnabled,
+        };
+        editorKind = 'yaml';
+        editorMode = 'yaml';
+      } catch (error) { setNotice(errorText(error), true); return; }
+    } else {
+      const textarea = root.querySelector<HTMLTextAreaElement>('#yaml-text');
+      if (textarea) yamlText = textarea.value;
+      editorMode = 'yaml';
+    }
+    render();
+  });
+  root.querySelector<HTMLButtonElement>('#editor-blocks')?.addEventListener('click', () => {
+    const textarea = root.querySelector<HTMLTextAreaElement>('#yaml-text');
+    if (textarea && textarea.value !== yamlText) yamlText = textarea.value;
+    try {
+      parsedYaml = parseWorldYaml(yamlText);
+      if (yamlBenchSource && yamlText.replace(/\r\n/g, '\n') === yamlBenchSource.text.replace(/\r\n/g, '\n')) {
+        bench = structuredClone(yamlBenchSource.draft);
+        presetFiles = { ...yamlFiles };
+        editorKind = 'bench';
+        editorMode = 'visual';
+        yamlBenchSource = undefined;
+      } else editorMode = 'blocks';
+      render();
+    } catch (error) { setNotice(errorText(error), true); }
+  });
+  root.querySelector<HTMLButtonElement>('#save-editor')?.addEventListener('click', () => void saveEditor(false));
+  root.querySelector<HTMLButtonElement>('#run-editor')?.addEventListener('click', () => void saveEditor(true));
 
   root.querySelector<HTMLInputElement>('#yaml-file')?.addEventListener('change', async (event) => {
     const file = (event.currentTarget as HTMLInputElement).files?.[0];
     if (!file) return;
     try {
       yamlText = await file.text();
+      yamlBenchSource = undefined;
       yamlName = file.name;
+      if (!editingWorldId) editingTitle = file.name.replace(/\.(ya?ml)$/i, '') || 'New emulation';
       yamlFiles = {};
       blockModes = {};
       parsedYaml = parseWorldYaml(yamlText);
-      blockModes = {};
       setNotice(`YAML loaded: found ${parsedYaml.needs.length} MCU(s).`, false);
       render();
     } catch (error) {
@@ -561,14 +675,11 @@ function bindUi(): void {
     if (text === yamlText) return;
     yamlText = text;
     parsedYaml = undefined;
-    yamlFiles = {};
-    yamlName = 'My configuration';
   });
   root.querySelector<HTMLButtonElement>('#validate-yaml')?.addEventListener('click', () => {
     try {
       yamlText = root.querySelector<HTMLTextAreaElement>('#yaml-text')?.value ?? yamlText;
       parsedYaml = parseWorldYaml(yamlText);
-      yamlFiles = {};
       setNotice(`Configuration is valid. Found ${parsedYaml.needs.length} MCU(s).`, false);
     } catch (error) {
       parsedYaml = undefined;
@@ -576,7 +687,6 @@ function bindUi(): void {
     }
     render();
   });
-  root.querySelector<HTMLButtonElement>('#launch-yaml')?.addEventListener('click', () => void launchYaml());
   root.querySelectorAll<HTMLButtonElement>('[data-block-mode]').forEach((button) => button.addEventListener('click', () => {
     const key = String(button.dataset.blockMode);
     if (button.dataset.mode === 'visual') {
@@ -669,7 +779,10 @@ function bindUi(): void {
       render();
     } catch (error) { setNotice(errorText(error), true); }
   }));
-  root.querySelector<HTMLButtonElement>('#refresh-worlds')?.addEventListener('click', () => void refreshWorlds());
+  root.querySelectorAll<HTMLButtonElement>('[data-edit-world]').forEach((button) => button.addEventListener('click', () => {
+    const world = worlds.find((item) => item.id === button.dataset.editWorld);
+    if (world) void openWorldEditor(world);
+  }));
   root.querySelectorAll<HTMLButtonElement>('[data-run-world]').forEach((button) => button.addEventListener('click', () => {
     const world = worlds.find((item) => item.id === button.dataset.runWorld);
     if (world) void launchSaved(world);
@@ -686,6 +799,10 @@ function bindUi(): void {
   }));
   root.querySelector<HTMLButtonElement>('#pause-sim')?.addEventListener('click', () => void pauseSimulation());
   root.querySelector<HTMLButtonElement>('#run-sim')?.addEventListener('click', () => void resumeSimulation());
+  root.querySelector<HTMLButtonElement>('#restart-sim')?.addEventListener('click', () => void restartSimulation());
+  root.querySelectorAll<HTMLElement>('[data-resize-height]').forEach(bindHeightResizer);
+  const widthHandle = root.querySelector<HTMLElement>('#event-width-resizer');
+  if (widthHandle) bindWidthResizer(widthHandle);
   root.querySelectorAll<HTMLButtonElement>('[data-toggle-control]').forEach((button) => button.addEventListener('click', () => {
     const id = String(button.dataset.toggleControl);
     const component = activeWorld?.bench?.components.find((item): item is GpioControlComponent => item.id === id && item.kind === 'gpio-control');
@@ -737,59 +854,79 @@ function capturePathsFromConfig(config: Record<string, unknown>): string[] {
   return [...paths];
 }
 
-async function launchPreset(): Promise<void> {
+async function saveEditor(run: boolean): Promise<void> {
   if (!store || busy) return;
   try {
-    validateBenchDraft(bench);
-    const result = benchYaml(bench);
-    if (!requiredFilesPresent(result.needs, presetFiles)) return setNotice('Select firmware for every CPU.', true);
-    const staged = Object.fromEntries(result.needs.map((need) => [need.key, presetFiles[need.key]]));
-    const modelsText = bench.cpus.map((cpu) => modelInfo(cpu.model)?.label.split(' · ')[0] ?? cpu.model).join(' + ');
-    const watch: WatchOptions = {
-      uart: bench.components.some((component) => component.kind === 'hardware-uart' || component.kind === 'soft-uart'),
-      radio: bench.radioEnabled,
+    let input: {
+      title: string;
+      yaml: string;
+      staged: Record<string, StagedFirmware>;
+      watch: WatchOptions;
+      netLabels: Record<string, string>;
+      preset: StoredWorld['preset'];
+      bench?: BenchDraft;
+      captures?: string[];
     };
-    await saveAndLaunch({
-      title: translate(`${bench.cpus.length > 1 ? 'Multi-board bench' : 'Bench'} · ${modelsText}`),
-      yaml: result.yaml,
-      staged,
-      watch,
-      netLabels: result.netLabels,
-      preset: bench.cpus.length > 1 ? 'pair' : 'single',
-      bench: structuredClone(bench),
-      captures: result.capturePaths,
-    });
-  } catch (error) { setNotice(errorText(error), true); }
-}
-
-async function launchYaml(): Promise<void> {
-  if (!store || busy) return;
-  try {
-    const text = root.querySelector<HTMLTextAreaElement>('#yaml-text')?.value ?? yamlText;
-    if (!parsedYaml || yamlText !== text) {
-      yamlText = text;
-      parsedYaml = parseWorldYaml(text);
-      yamlFiles = {};
-      render();
-      return setNotice('Configuration validated. Select firmware images and run it again.', false);
+    const rawText = editorKind === 'yaml' && editorMode === 'yaml'
+      ? root.querySelector<HTMLTextAreaElement>('#yaml-text')?.value ?? yamlText
+      : yamlText;
+    const originalBench = editorKind === 'yaml' && yamlBenchSource && rawText.replace(/\r\n/g, '\n') === yamlBenchSource.text.replace(/\r\n/g, '\n')
+      ? yamlBenchSource.draft
+      : undefined;
+    if ((editorKind === 'bench' && editorMode === 'visual') || originalBench) {
+      const draft = originalBench ?? bench;
+      const files = originalBench ? yamlFiles : presetFiles;
+      validateBenchDraft(draft);
+      const result = benchYaml(draft);
+      if (!requiredFilesPresent(result.needs, files)) return setNotice('Select firmware for every CPU.', true);
+      const modelsText = draft.cpus.map((cpu) => modelInfo(cpu.model)?.label.split(' · ')[0] ?? cpu.model).join(' + ');
+      input = {
+        title: translate(`${draft.cpus.length > 1 ? 'Multi-board bench' : 'Bench'} · ${modelsText}`),
+        yaml: result.yaml,
+        staged: Object.fromEntries(result.needs.map((need) => [need.key, files[need.key]])),
+        watch: {
+          uart: draft.components.some((component) => component.kind === 'hardware-uart' || component.kind === 'soft-uart'),
+          radio: draft.radioEnabled,
+        },
+        netLabels: result.netLabels,
+        preset: draft.cpus.length > 1 ? 'pair' : 'single',
+        bench: structuredClone(draft),
+        captures: result.capturePaths,
+      };
+    } else {
+      const text = editorMode === 'yaml'
+        ? root.querySelector<HTMLTextAreaElement>('#yaml-text')?.value ?? yamlText
+        : yamlText;
+      if (text !== yamlText || !parsedYaml) {
+        yamlText = text;
+        parsedYaml = parseWorldYaml(text);
+      }
+      if (!parsedYaml) throw new Error('Load or validate a YAML configuration first.');
+      if (!requiredFilesPresent(parsedYaml.needs, yamlFiles)) {
+        render();
+        setNotice('Select firmware for each MCU and each flash fragment.', true);
+        return;
+      }
+      const title = editingWorldId
+        ? editingTitle
+        : yamlName === 'My configuration' ? translate(yamlName) : yamlName.replace(/\.(ya?ml)$/i, '') || translate('My configuration');
+      input = {
+        title,
+        yaml: yamlText,
+        staged: Object.fromEntries(parsedYaml.needs.map((need) => [need.key, yamlFiles[need.key]])),
+        watch: yamlWatch,
+        netLabels: {},
+        preset: 'yaml',
+        captures: capturePathsFromConfig(parsedYaml.value),
+      };
     }
-    if (!requiredFilesPresent(parsedYaml.needs, yamlFiles)) return setNotice('Select firmware for each MCU and each flash fragment.', true);
-    const title = yamlName === 'My configuration' ? translate(yamlName) : yamlName.replace(/\.(ya?ml)$/i, '') || translate('My configuration');
-    await saveAndLaunch({
-      title,
-      yaml: yamlText,
-      staged: Object.fromEntries(parsedYaml.needs.map((need) => [need.key, yamlFiles[need.key]])),
-      watch: yamlWatch,
-      netLabels: {},
-      preset: 'yaml',
-      captures: capturePathsFromConfig(parsedYaml.value),
-    });
+    await saveWorld(input, run);
   } catch (error) {
     setNotice(errorText(error), true);
   }
 }
 
-async function saveAndLaunch(input: {
+async function saveWorld(input: {
   title: string;
   yaml: string;
   staged: Record<string, StagedFirmware>;
@@ -798,16 +935,26 @@ async function saveAndLaunch(input: {
   preset: StoredWorld['preset'];
   bench?: BenchDraft;
   captures?: string[];
-}): Promise<void> {
+}, run: boolean): Promise<void> {
   if (!store) return;
   busy = true;
   render();
   try {
-    const world = await store.save(input);
+    const world = await store.save({ ...input, id: editingWorldId, run });
+    editingWorldId = world.id;
+    editingTitle = world.title;
     worlds = await store.list();
-    await launchWorld(world);
-    await refreshStorage();
-    setNotice('World saved locally and started in the browser.', false);
+    if (run) {
+      await launchWorld(world);
+      setNotice('World saved and started in the browser.', false);
+    } else {
+      if (activeStatus.running) await client.pause();
+      stopPump();
+      activeWorld = undefined;
+      activeEndpoints = [];
+      activeStatus = { loaded: false, running: false, speed: 0 };
+      setNotice('World saved locally.', false);
+    }
   } catch (error) {
     setNotice(storageErrorText(error), true);
   } finally {
@@ -823,6 +970,7 @@ async function launchSaved(world: StoredWorld): Promise<void> {
   try {
     const updated = await store.touch(world.id);
     worlds = await store.list();
+    await loadWorldIntoEditor(updated);
     await launchWorld(updated);
     setNotice('Saved world loaded and started.', false);
   } catch (error) {
@@ -831,6 +979,81 @@ async function launchSaved(world: StoredWorld): Promise<void> {
     busy = false;
     render();
   }
+}
+
+async function firmwareForWorld(world: StoredWorld): Promise<Record<string, StagedFirmware>> {
+  const staged: Record<string, StagedFirmware> = {};
+  if (!store) return staged;
+  await Promise.all(Object.entries(world.firmwares).map(async ([key, firmware]) => {
+    const blob = await store!.blob(firmware.hash);
+    staged[key] = { ...firmware, bytes: blob.bytes };
+  }));
+  return staged;
+}
+
+async function loadWorldIntoEditor(world: StoredWorld): Promise<void> {
+  if (activeStatus.running) await client.pause();
+  stopPump();
+  const staged = await firmwareForWorld(world);
+  editingWorldId = world.id;
+  editingTitle = world.title;
+  if (world.bench) {
+    bench = structuredClone(world.bench);
+    presetFiles = staged;
+    yamlFiles = {};
+    parsedYaml = undefined;
+    editorKind = 'bench';
+    editorMode = 'visual';
+  } else {
+    presetFiles = {};
+    yamlBenchSource = undefined;
+    yamlText = world.yaml;
+    yamlName = world.title;
+    yamlWatch = { ...world.watch };
+    yamlFiles = staged;
+    blockModes = {};
+    editorKind = 'yaml';
+    try {
+      parsedYaml = parseWorldYaml(yamlText);
+      editorMode = 'blocks';
+    } catch {
+      parsedYaml = undefined;
+      editorMode = 'yaml';
+    }
+  }
+  tab = 'editor';
+  render();
+}
+
+async function openWorldEditor(world: StoredWorld): Promise<void> {
+  if (busy) return;
+  try {
+    await loadWorldIntoEditor(world);
+  } catch (error) { setNotice(storageErrorText(error), true); }
+}
+
+async function newEditor(): Promise<void> {
+  if (busy) return;
+  try {
+    if (activeStatus.running) await client.pause();
+    stopPump();
+    editingWorldId = undefined;
+    editingTitle = 'New emulation';
+    yamlBenchSource = undefined;
+    bench = { cpus: [{ id: 'board', model: 'tlsr8258' }], components: [{ id: 'uart0-log', kind: 'hardware-uart', cpuId: 'board', port: 'uart0', baudNote: '115200' }], steps: [], radioEnabled: true, capturePcap: true };
+    presetFiles = {};
+    yamlFiles = {};
+    yamlText = '';
+    yamlName = 'My configuration';
+    parsedYaml = undefined;
+    yamlWatch = { uart: true, radio: true };
+    blockModes = {};
+    openYamlBlocks.clear();
+    editorKind = 'bench';
+    editorMode = 'visual';
+    tab = 'editor';
+    render();
+  } catch (error) { setNotice(errorText(error), true); }
 }
 
 async function launchWorld(world: StoredWorld): Promise<void> {
@@ -856,7 +1079,7 @@ async function launchWorld(world: StoredWorld): Promise<void> {
   }
   activeEndpoints = [];
   activeStatus = { loaded: false, running: false, speed: 0 };
-  tab = 'saved';
+  tab = 'run';
   render();
   activeEndpoints = await client.loadWorld(world, store!);
   for (const component of world.bench?.components ?? []) {
@@ -873,6 +1096,120 @@ async function launchWorld(world: StoredWorld): Promise<void> {
   activeStatus = { loaded: true, running: true, speed: 0 };
   render();
   startPump();
+}
+
+function applyResizerSettings(): void {
+  root.style.setProperty('--uart-panel-ratio', `${uartPanelRatio}fr`);
+  root.style.setProperty('--radio-panel-ratio', `${1 - uartPanelRatio}fr`);
+  for (const feedId of LOG_FEEDS) {
+    const height = logHeights[feedId];
+    const feed = root.querySelector<HTMLElement>(`#${feedId}`);
+    if (!feed || height === undefined) continue;
+    feed.style.height = `${height}px`;
+    feed.style.maxHeight = 'none';
+  }
+}
+
+function applyFeedHeight(feedId: typeof LOG_FEEDS[number], height: number): void {
+  const feed = root.querySelector<HTMLElement>(`#${feedId}`);
+  if (!feed) return;
+  const boundedHeight = Math.round(Math.max(MIN_LOG_HEIGHT, Math.min(MAX_LOG_HEIGHT, height)));
+  logHeights[feedId] = boundedHeight;
+  feed.style.height = `${boundedHeight}px`;
+  feed.style.maxHeight = 'none';
+  root.querySelector<HTMLElement>(`[data-resize-height="${feedId}"]`)
+    ?.setAttribute('aria-valuenow', String(boundedHeight));
+}
+
+function applyPanelRatio(ratio: number): void {
+  uartPanelRatio = Math.max(MIN_PANEL_RATIO, Math.min(MAX_PANEL_RATIO, ratio));
+  root.style.setProperty('--uart-panel-ratio', `${uartPanelRatio}fr`);
+  root.style.setProperty('--radio-panel-ratio', `${1 - uartPanelRatio}fr`);
+  root.querySelector<HTMLElement>('#event-width-resizer')
+    ?.setAttribute('aria-valuenow', String(Math.round(uartPanelRatio * 100)));
+}
+
+function persistResizerSettings(): void {
+  try {
+    localStorage.setItem('mcuemu-web.log-heights', JSON.stringify(logHeights));
+    localStorage.setItem('mcuemu-web.uart-radio-ratio', String(uartPanelRatio));
+  } catch {
+    // Resizing still works for this page when browser storage is unavailable.
+  }
+}
+
+function bindHeightResizer(handle: HTMLElement): void {
+  const feedId = handle.dataset.resizeHeight as typeof LOG_FEEDS[number] | undefined;
+  if (!feedId || !LOG_FEEDS.includes(feedId)) return;
+
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const feed = root.querySelector<HTMLElement>(`#${feedId}`);
+    if (!feed) return;
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = feed.getBoundingClientRect().height;
+    root.classList.add('is-resizing-height');
+    const move = (moveEvent: PointerEvent) => applyFeedHeight(feedId, startHeight + moveEvent.clientY - startY);
+    const finish = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', finish);
+      root.classList.remove('is-resizing-height');
+      persistResizerSettings();
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
+    handle.setPointerCapture(event.pointerId);
+  });
+
+  handle.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+    const feed = root.querySelector<HTMLElement>(`#${feedId}`);
+    if (!feed) return;
+    const current = logHeights[feedId] ?? feed.getBoundingClientRect().height;
+    applyFeedHeight(feedId, current + (event.key === 'ArrowDown' ? 20 : -20));
+    persistResizerSettings();
+    event.preventDefault();
+  });
+}
+
+function bindWidthResizer(handle: HTMLElement): void {
+  handle.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    const grid = handle.closest<HTMLElement>('.event-grid');
+    if (!grid) return;
+    event.preventDefault();
+    root.classList.add('is-resizing-width');
+    const move = (moveEvent: PointerEvent) => {
+      const gridRect = grid.getBoundingClientRect();
+      const handleWidth = handle.getBoundingClientRect().width;
+      const gap = Number.parseFloat(getComputedStyle(grid).columnGap) || 0;
+      const availableWidth = gridRect.width - handleWidth - gap * 2;
+      if (availableWidth <= 0) return;
+      const leftWidth = moveEvent.clientX - gridRect.left - gap - handleWidth / 2;
+      applyPanelRatio(leftWidth / availableWidth);
+    };
+    const finish = () => {
+      handle.removeEventListener('pointermove', move);
+      handle.removeEventListener('pointerup', finish);
+      handle.removeEventListener('pointercancel', finish);
+      root.classList.remove('is-resizing-width');
+      persistResizerSettings();
+    };
+    handle.addEventListener('pointermove', move);
+    handle.addEventListener('pointerup', finish);
+    handle.addEventListener('pointercancel', finish);
+    handle.setPointerCapture(event.pointerId);
+  });
+
+  handle.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+    applyPanelRatio(uartPanelRatio + (event.key === 'ArrowRight' ? 0.05 : -0.05));
+    persistResizerSettings();
+    event.preventDefault();
+  });
 }
 
 async function setControl(component: GpioControlComponent, pressed: boolean): Promise<void> {
@@ -896,7 +1233,6 @@ async function removeWorld(world: StoredWorld): Promise<void> {
   try {
     await store.remove(world.id);
     worlds = await store.list();
-    await refreshStorage();
     setNotice(`“${displayWorldTitle(world)}” deleted. Unused firmware files were removed.`, false);
     render();
   } catch (error) { setNotice(storageErrorText(error), true); }
@@ -918,6 +1254,22 @@ async function resumeSimulation(): Promise<void> {
     startPump();
     render();
   } catch (error) { setNotice(errorText(error), true); }
+}
+
+async function restartSimulation(): Promise<void> {
+  const world = activeWorld;
+  if (!world || !store || busy) return;
+  busy = true;
+  render();
+  try {
+    await launchWorld(world);
+    setNotice('Simulation restarted from time zero.', false);
+  } catch (error) {
+    setNotice(errorText(error), true);
+  } finally {
+    busy = false;
+    render();
+  }
 }
 
 function startPump(): void {
@@ -1135,8 +1487,10 @@ function updateStatusDom(): void {
   status.textContent = `${translate(activeStatus.running ? 'Running' : activeStatus.loaded ? 'Paused' : 'Loading')}${time}${mcuSummary ? ` · ${mcuSummary}` : ''}`;
   const pause = document.querySelector<HTMLButtonElement>('#pause-sim');
   const run = document.querySelector<HTMLButtonElement>('#run-sim');
-  if (pause) pause.disabled = !activeStatus.running;
-  if (run) run.disabled = activeStatus.running || !activeStatus.loaded;
+  const restart = document.querySelector<HTMLButtonElement>('#restart-sim');
+  if (pause) pause.disabled = !activeStatus.running || busy;
+  if (run) run.disabled = activeStatus.running || !activeStatus.loaded || busy;
+  if (restart) restart.disabled = !activeStatus.loaded || busy;
 }
 
 function scheduleEventRender(): void {
@@ -1155,23 +1509,9 @@ function storageErrorText(error: unknown): string {
   const name = error && typeof error === 'object' && 'name' in error ? String((error as { name: string }).name) : '';
   const message = errorText(error);
   if (name === 'QuotaExceededError' || /quota|storage.*full|disk.*full/i.test(message)) {
-    return 'Browser storage is full. Delete unused worlds in History and try again.';
+    return 'Browser storage is full. Delete unused emulations from Worlds and try again.';
   }
   return message;
-}
-
-async function refreshStorage(): Promise<void> {
-  if (!store) return;
-  storageEstimate = await store.estimate().catch(() => ({}));
-}
-
-async function refreshWorlds(): Promise<void> {
-  if (!store) return;
-  try {
-    worlds = await store.list();
-    await refreshStorage();
-    render();
-  } catch (error) { setNotice(storageErrorText(error), true); }
 }
 
 client.setEventListener((event) => {
@@ -1203,7 +1543,6 @@ async function init(): Promise<void> {
   try {
     store = await WorldStore.open();
     worlds = await store.list();
-    await refreshStorage();
     render();
   } catch (error) {
     setNotice(`Local storage is unavailable: ${errorText(error)}`, true);

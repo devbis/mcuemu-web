@@ -22,25 +22,33 @@ describe('world history in IndexedDB', () => {
     await deleteDatabase();
   });
 
-  it('updates repeat launches, keeps edited configs separate, and deduplicates firmware blobs', async () => {
+  it('updates a stable world ID, saves without marking a run, and deduplicates firmware blobs', async () => {
     const bytes = new Uint8Array([1, 2, 3, 4]).buffer;
     const staged = { 'board.main#0': { hash: 'content-hash', name: 'firmware.bin', size: 4, bytes } };
     const common = { staged, watch: { uart: true, radio: true }, netLabels: {}, preset: 'single' as const };
-    const first = await store.save({ ...common, title: 'First', yaml: 'version: 1\ndevices: []\n' });
+    const first = await store.save({ ...common, id: 'legacy-content-derived-id', title: 'First', yaml: 'version: 1\ndevices: []\n', run: true });
     await new Promise((resolve) => setTimeout(resolve, 5));
-    const repeated = await store.save({ ...common, title: 'First', yaml: 'version: 1\ndevices: []\n' });
+    const repeated = await store.save({ ...common, id: first.id, title: 'First', yaml: 'version: 1\ndevices: []\n', run: true });
     expect(repeated.id).toBe(first.id);
     expect(repeated.createdAt).toBe(first.createdAt);
     expect(repeated.lastRunAt).toBeGreaterThan(first.lastRunAt);
 
-    const edited = await store.save({ ...common, title: 'Edited', yaml: 'version: 1\ndevices: []\n# changed config\n' });
-    expect(edited.id).not.toBe(first.id);
-    expect((await store.list()).length).toBe(2);
+    const saved = await store.save({ ...common, id: first.id, title: 'Edited', yaml: 'version: 1\ndevices: []\n# changed config\n' });
+    expect(saved.id).toBe(first.id);
+    expect(saved.lastRunAt).toBe(repeated.lastRunAt);
+    expect((await store.list()).length).toBe(1);
     expect((await store.blob('content-hash')).size).toBe(4);
 
     await store.remove(first.id);
-    expect((await store.blob('content-hash')).size).toBe(4);
-    await store.remove(edited.id);
     await expect(store.blob('content-hash')).rejects.toThrow(/Firmware not found in IndexedDB/);
+  });
+
+  it('gives new worlds independent IDs, including when their configurations match', async () => {
+    const common = { staged: {}, watch: { uart: true, radio: false }, netLabels: {}, preset: 'yaml' as const };
+    const first = await store.save({ ...common, title: 'First', yaml: 'version: 1\ndevices: []\n' });
+    const second = await store.save({ ...common, title: 'Second', yaml: 'version: 1\ndevices: []\n' });
+    expect(second.id).not.toBe(first.id);
+    expect((await store.list()).length).toBe(2);
+    expect(first.lastRunAt).toBe(0);
   });
 });
