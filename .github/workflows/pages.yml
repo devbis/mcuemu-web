@@ -35,9 +35,10 @@ jobs:
             echo "Add MCUEMU_ACTIONS_READ_TOKEN with read-only Actions access to devbis/mcuemu." >&2
             exit 1
           fi
-          run_id="$(gh run list --repo devbis/mcuemu --workflow wasm.yml --branch wasm --status completed --limit 100 --json databaseId,conclusion --jq '[.[] | select(.conclusion == "success")][0].databaseId // empty')"
+          default_branch="$(gh api repos/devbis/mcuemu --jq '.default_branch')"
+          run_id="$(gh run list --repo devbis/mcuemu --workflow wasm.yml --branch "$default_branch" --status completed --limit 100 --json databaseId,conclusion --jq '[.[] | select(.conclusion == "success")][0].databaseId // empty')"
           if [ -z "$run_id" ]; then
-            echo "No successful wasm.yml run was found on devbis/mcuemu:wasm." >&2
+            echo "No successful wasm.yml run was found on devbis/mcuemu:$default_branch." >&2
             exit 1
           fi
           mkdir -p public/wasm
